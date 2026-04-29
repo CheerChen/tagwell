@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tagwell"
+version = "0.1.0"
+description = "Read-only local music metadata scanner — exports JSONL snapshots of audio file tags and properties."
+requires-python = ">=3.11"
+license = "MIT"
+readme = "README.md"
+dependencies = ["click>=8.1", "mutagen>=1.47", "rich>=13.0"]
+
+[project.scripts]
+tagwell = "tagwell.cli:cli"
+
+[dependency-groups]
+dev = ["pytest>=7.0", "pytest-cov"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tagwell"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
