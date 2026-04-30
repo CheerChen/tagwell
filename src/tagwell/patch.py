@@ -1,7 +1,8 @@
-"""Patch missing release-level tags by querying the MusicBrainz API.
+"""Patch missing MusicBrainz tags by querying the MusicBrainz API.
 
-Currently patches: script, releasecountry.
-Only writes to files that already have a release_id but are missing these fields.
+Patches release-level tags (script, releasecountry) and recording IDs.
+Only writes to files that already have enough MusicBrainz IDs to resolve the
+missing fields.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ _USER_AGENT = "tagwell/0.1.0 ( https://github.com/CheerChen/tagwell )"
 _MB_API_BASE = "https://musicbrainz.org/ws/2"
 
 Snapshot = dict[str, Any]
+PatchMode = str
 
 
 # ---------- MusicBrainz API ----------
@@ -38,11 +40,13 @@ Snapshot = dict[str, Any]
 class ReleaseInfo:
     script: str | None = None
     country: str | None = None
+    track_recordings: dict[str, str] = field(default_factory=dict)
 
 
-def fetch_release_info(release_id: str) -> ReleaseInfo:
-    """Fetch script and country from the MusicBrainz release endpoint."""
-    url = f"{_MB_API_BASE}/release/{release_id}?fmt=json"
+def fetch_release_info(release_id: str, *, include_recordings: bool = False) -> ReleaseInfo:
+    """Fetch release metadata from the MusicBrainz release endpoint."""
+    query = "inc=recordings&fmt=json" if include_recordings else "fmt=json"
+    url = f"{_MB_API_BASE}/release/{release_id}?{query}"
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     with urllib.request.urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read())
@@ -50,7 +54,20 @@ def fetch_release_info(release_id: str) -> ReleaseInfo:
     return ReleaseInfo(
         script=text_rep.get("script"),
         country=data.get("country"),
+        track_recordings=_extract_track_recordings(data),
     )
+
+
+def _extract_track_recordings(data: dict[str, Any]) -> dict[str, str]:
+    """Return MusicBrainz release-track-id -> recording-id mappings."""
+    track_recordings: dict[str, str] = {}
+    for medium in data.get("media", []):
+        for track in medium.get("tracks", []):
+            track_id = track.get("id")
+            recording_id = (track.get("recording") or {}).get("id")
+            if track_id and recording_id:
+                track_recordings[track_id] = recording_id
+    return track_recordings
 
 
 # ---------- Snapshot analysis ----------
@@ -62,8 +79,10 @@ class PatchTarget:
     absolute_path: Path
     tag_format: str
     release_id: str
+    release_track_id: str | None = None
     needs_script: bool = False
     needs_country: bool = False
+    needs_recording_id: bool = False
 
 
 def _has_raw_tag(snapshot: Snapshot, field_name: str) -> bool:
@@ -85,9 +104,9 @@ _RAW_KEY_ALIASES: dict[str, list[str]] = {
 
 
 def find_patch_targets(
-    header: Snapshot | None, snapshots: list[Snapshot]
+    header: Snapshot | None, snapshots: list[Snapshot], *, mode: PatchMode = "release-tags"
 ) -> list[PatchTarget]:
-    """Identify files that have release_id but are missing script/releasecountry."""
+    """Identify files that can be patched in the requested mode."""
     root = Path(header["scan"]["root"]) if header else Path(".")
     targets: list[PatchTarget] = []
 
@@ -96,6 +115,7 @@ def find_patch_targets(
         release_id = mb.get("release_id")
         if not release_id:
             continue
+        release_track_id = mb.get("release_track_id")
 
         tag_format = snap.get("tags", {}).get("format")
         if not tag_format:
@@ -104,8 +124,17 @@ def find_patch_targets(
         rel_path = snap.get("file", {}).get("relative_path", "")
         has_script = _has_raw_tag(snap, "script")
         has_country = _has_raw_tag(snap, "releasecountry")
+        has_recording_id = bool(mb.get("recording_id"))
 
-        if has_script and has_country:
+        needs_script = mode in ("release-tags", "all") and not has_script
+        needs_country = mode in ("release-tags", "all") and not has_country
+        needs_recording_id = (
+            mode in ("recording-id", "all")
+            and not has_recording_id
+            and bool(release_track_id)
+        )
+
+        if not (needs_script or needs_country or needs_recording_id):
             continue
 
         targets.append(PatchTarget(
@@ -113,8 +142,10 @@ def find_patch_targets(
             absolute_path=root / rel_path,
             tag_format=tag_format,
             release_id=release_id,
-            needs_script=not has_script,
-            needs_country=not has_country,
+            release_track_id=release_track_id,
+            needs_script=needs_script,
+            needs_country=needs_country,
+            needs_recording_id=needs_recording_id,
         ))
 
     return targets
@@ -137,6 +168,10 @@ def _write_tags(target: PatchTarget, info: ReleaseInfo) -> list[str]:
         if target.needs_country and info.country:
             mf.tags["releasecountry"] = [info.country]
             written.append("releasecountry")
+        recording_id = _recording_id_for_target(target, info)
+        if recording_id:
+            mf.tags["musicbrainz_trackid"] = [recording_id]
+            written.append("recording_id")
 
     elif target.tag_format == "id3":
         from mutagen.id3 import TXXX
@@ -149,6 +184,10 @@ def _write_tags(target: PatchTarget, info: ReleaseInfo) -> list[str]:
         if target.needs_country and info.country:
             tags.add(TXXX(encoding=3, desc="MusicBrainz Album Release Country", text=[info.country]))
             written.append("releasecountry")
+        recording_id = _recording_id_for_target(target, info)
+        if recording_id:
+            tags.add(TXXX(encoding=3, desc="MusicBrainz Track Id", text=[recording_id]))
+            written.append("recording_id")
 
     elif target.tag_format == "mp4" and isinstance(mf, MP4):
         prefix = "----:com.apple.iTunes:"
@@ -158,11 +197,21 @@ def _write_tags(target: PatchTarget, info: ReleaseInfo) -> list[str]:
         if target.needs_country and info.country:
             mf.tags[f"{prefix}MusicBrainz Album Release Country"] = [info.country.encode("utf-8")]
             written.append("releasecountry")
+        recording_id = _recording_id_for_target(target, info)
+        if recording_id:
+            mf.tags[f"{prefix}MusicBrainz Track Id"] = [recording_id.encode("utf-8")]
+            written.append("recording_id")
 
     if written:
         mf.save()
 
     return written
+
+
+def _recording_id_for_target(target: PatchTarget, info: ReleaseInfo) -> str | None:
+    if not target.needs_recording_id or not target.release_track_id:
+        return None
+    return info.track_recordings.get(target.release_track_id)
 
 
 # ---------- Orchestrator ----------
@@ -190,15 +239,17 @@ class PatchPlan:
 def build_plan(
     jsonl_path: Path,
     *,
+    mode: PatchMode = "release-tags",
     delay: float = 1.0,
     on_progress: Any = None,
 ) -> PatchPlan:
     """Load JSONL → find targets → fetch MB API → return plan."""
     header, snapshots = load_snapshots(jsonl_path)
-    targets = find_patch_targets(header, snapshots)
+    targets = find_patch_targets(header, snapshots, mode=mode)
 
     # Deduplicate release_ids
     release_ids = sorted({t.release_id for t in targets})
+    include_recordings = mode in ("recording-id", "all")
 
     release_cache: dict[str, ReleaseInfo] = {}
     api_failures: dict[str, str] = {}
@@ -207,7 +258,7 @@ def build_plan(
         if on_progress:
             on_progress(i, len(release_ids), rid)
         try:
-            release_cache[rid] = fetch_release_info(rid)
+            release_cache[rid] = fetch_release_info(rid, include_recordings=include_recordings)
         except Exception as exc:
             api_failures[rid] = str(exc)
         if i < len(release_ids):
@@ -238,7 +289,8 @@ def apply_plan(plan: PatchPlan) -> tuple[PatchSummary, list[tuple[str, list[str]
         # Check if there's actually something to write
         would_write_script = target.needs_script and info.script
         would_write_country = target.needs_country and info.country
-        if not would_write_script and not would_write_country:
+        would_write_recording_id = _recording_id_for_target(target, info)
+        if not would_write_script and not would_write_country and not would_write_recording_id:
             summary.files_skipped += 1
             continue
         try:
@@ -275,6 +327,9 @@ def dry_run_plan(plan: PatchPlan) -> tuple[PatchSummary, list[tuple[str, list[st
             fields.append(f"script = {info.script}")
         if target.needs_country and info.country:
             fields.append(f"releasecountry = {info.country}")
+        recording_id = _recording_id_for_target(target, info)
+        if recording_id:
+            fields.append(f"recording_id = {recording_id}")
         if fields:
             actions.append((target.relative_path, fields))
             summary.files_patched += 1

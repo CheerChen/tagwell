@@ -6,12 +6,19 @@ from typing import Any
 
 import mutagen
 from mutagen.flac import FLAC
-from mutagen.mp3 import MP3
+from mutagen.mp3 import MP3, BitrateMode
 from mutagen.mp4 import MP4
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from mutagen.aiff import AIFF
 from mutagen.wave import WAVE
+
+
+_BITRATE_MODE_NAMES = {
+    BitrateMode.CBR: "cbr",
+    BitrateMode.VBR: "vbr",
+    BitrateMode.ABR: "abr",
+}
 
 
 def extract_audio_info(mf: mutagen.FileType) -> dict[str, Any]:
@@ -44,7 +51,43 @@ def extract_audio_info(mf: mutagen.FileType) -> dict[str, Any]:
         "bit_depth": bit_depth,
         "lossless": lossless,
         "estimated_bitrate_kbps": estimated_bitrate_kbps,
+        "bitrate_mode": _bitrate_mode(mf),
+        "encoder_info": _encoder_info(mf),
+        "encoder_settings": _encoder_settings(mf),
+        "sketchy": _sketchy(mf),
     }
+
+
+def _bitrate_mode(mf: mutagen.FileType) -> str | None:
+    """MP3 only: 'cbr' / 'vbr' / 'abr'. None for UNKNOWN or other formats."""
+    if not isinstance(mf, MP3):
+        return None
+    mode = getattr(mf.info, "bitrate_mode", None)
+    return _BITRATE_MODE_NAMES.get(mode)
+
+
+def _encoder_info(mf: mutagen.FileType) -> str | None:
+    """Encoder identity string. MP3: LAME tag info. FLAC: Vorbis comment vendor."""
+    if isinstance(mf, MP3):
+        return getattr(mf.info, "encoder_info", "") or None
+    if isinstance(mf, FLAC):
+        vendor = getattr(getattr(mf, "tags", None), "vendor", None)
+        return vendor or None
+    return None
+
+
+def _encoder_settings(mf: mutagen.FileType) -> str | None:
+    """MP3 only: LAME settings string (e.g. '-b 320')."""
+    if isinstance(mf, MP3):
+        return getattr(mf.info, "encoder_settings", "") or None
+    return None
+
+
+def _sketchy(mf: mutagen.FileType) -> bool | None:
+    """MP3 only: True if mutagen had to fall back to lenient frame parsing."""
+    if not isinstance(mf, MP3):
+        return None
+    return bool(getattr(mf.info, "sketchy", False))
 
 
 def _classify(mf: mutagen.FileType) -> tuple[str | None, str | None, bool | None]:
@@ -91,4 +134,8 @@ def _empty_audio() -> dict[str, Any]:
         "bit_depth": None,
         "lossless": None,
         "estimated_bitrate_kbps": None,
+        "bitrate_mode": None,
+        "encoder_info": None,
+        "encoder_settings": None,
+        "sketchy": None,
     }

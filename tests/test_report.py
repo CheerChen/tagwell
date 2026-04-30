@@ -209,8 +209,8 @@ class TestReport:
         assert "- `Alpha/01 - First.mp3`" not in report  # detail listing removed
         assert "All 4 files have embedded cover art." in report
         assert "| No cover art |" not in report
-        assert "All lossy files are 320 kbps." in report
-        assert "#### Lossy bitrate distribution" not in report
+        assert "### Encoding profile" not in report
+        assert "Lossy bitrate distribution" not in report
         assert "| Beta | Artist B | 2 | 5 | 40.0% |" in report
 
     def test_report_merges_missing_release_id_track_into_single_album_group(self, tmp_path: Path):

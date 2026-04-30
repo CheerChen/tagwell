@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -12,6 +13,9 @@ from rich.table import Table
 
 from tagwell.scan import scan_library
 from tagwell.report import generate_report
+from tagwell.quality import generate_quality_report
+from tagwell.releases_report import generate_releases_report
+from tagwell.complete import build_releases_jsonl
 from tagwell.patch import build_plan, apply_plan, dry_run_plan
 
 console = Console(stderr=True)
@@ -64,38 +68,135 @@ def scan(
         sys.exit(1)
 
 
-@cli.command()
-@click.argument("jsonl_file", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
-@click.option("--out", "-o", "output", required=True, type=click.Path(dir_okay=False), help="Output Markdown report path.")
-def report(jsonl_file: str, output: str) -> None:
-    """Generate a metadata quality report from a tagwell JSONL file."""
+@cli.group()
+def report() -> None:
+    """Generate Markdown reports from tagwell JSONL files."""
+
+
+def _auto_report_path(report_type: str) -> Path:
+    """Return a timestamped report path in the current working directory."""
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    return Path(f"report-{report_type}-{ts}.md")
+
+
+def _render_report(name: str, jsonl_file: str, output: str | None, autoname: bool, generator) -> None:
     jsonl_path = Path(jsonl_file)
-    out_path = Path(output)
+    if autoname or output is None:
+        out_path = _auto_report_path(name)
+    else:
+        out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    console.print(f"[bold]tagwell report[/bold]  {jsonl_path}")
-    md = generate_report(jsonl_path)
+    console.print(f"[bold]tagwell report {name}[/bold]  {jsonl_path}")
+    md = generator(jsonl_path)
     out_path.write_text(md, encoding="utf-8")
     console.print(f"  output → {out_path} ({_human_size(out_path.stat().st_size)})")
 
 
+@report.command("metadata")
+@click.argument("jsonl_file", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
+@click.option("--out", "-o", "output", default=None, type=click.Path(dir_okay=False), help="Output Markdown report path.")
+@click.option("-O", "autoname", is_flag=True, default=False, help="Auto-name output as report-metadata-{yyyymmddhhmmss}.md in cwd.")
+def report_metadata(jsonl_file: str, output: str | None, autoname: bool) -> None:
+    """Tag-quality view of a library JSONL: MBID coverage, parsed fields, library shape."""
+    if output is None and not autoname:
+        raise click.UsageError("Provide --out PATH or -O for auto-naming.")
+    _render_report("metadata", jsonl_file, output, autoname, generate_report)
+
+
+@report.command("quality")
+@click.argument("jsonl_file", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
+@click.option("--out", "-o", "output", default=None, type=click.Path(dir_okay=False), help="Output Markdown report path.")
+@click.option("-O", "autoname", is_flag=True, default=False, help="Auto-name output as report-quality-{yyyymmddhhmmss}.md in cwd.")
+def report_quality(jsonl_file: str, output: str | None, autoname: bool) -> None:
+    """Audio-source quality view of a library JSONL: codec, bitrate, encoder integrity."""
+    if output is None and not autoname:
+        raise click.UsageError("Provide --out PATH or -O for auto-naming.")
+    _render_report("quality", jsonl_file, output, autoname, generate_quality_report)
+
+
+@report.command("releases")
+@click.argument("jsonl_file", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
+@click.option("--out", "-o", "output", default=None, type=click.Path(dir_okay=False), help="Output Markdown report path.")
+@click.option("-O", "autoname", is_flag=True, default=False, help="Auto-name output as report-releases-{yyyymmddhhmmss}.md in cwd.")
+def report_releases(jsonl_file: str, output: str | None, autoname: bool) -> None:
+    """Release-level view of a library_releases JSONL: completeness, MB match audit, MB-canonical shape."""
+    if output is None and not autoname:
+        raise click.UsageError("Provide --out PATH or -O for auto-naming.")
+    _render_report("releases", jsonl_file, output, autoname, generate_releases_report)
+
+
 @cli.command()
 @click.argument("jsonl_file", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
+@click.option("--out", "-o", "output", required=True, type=click.Path(dir_okay=False), help="Output JSONL path (e.g. library_releases.jsonl).")
+@click.option("--delay", type=float, default=1.0, show_default=True, help="Seconds between MusicBrainz API requests.")
+@click.option("--refresh", is_flag=True, default=False, help="Re-fetch every release, ignoring the existing output file.")
+def complete(jsonl_file: str, output: str, delay: float, refresh: bool) -> None:
+    """Enrich a library JSONL with release-level MusicBrainz data and per-track local presence."""
+    jsonl_path = Path(jsonl_file)
+    out_path = Path(output)
+
+    mode = "[bold red]REFRESH[/bold red]" if refresh else "[bold]incremental[/bold]"
+    console.print(f"[bold]tagwell complete[/bold]  {jsonl_path}  ({mode})")
+    console.print(f"  output → {out_path}")
+    console.print()
+
+    def on_progress(i: int, total: int, rid: str) -> None:
+        console.print(f"  [{i}/{total}] {rid[:12]}…")
+
+    summary = build_releases_jsonl(
+        jsonl_path,
+        out_path,
+        delay=delay,
+        refresh=refresh,
+        on_progress=on_progress,
+    )
+
+    console.print()
+    table = Table(title="Complete Summary", show_header=False, title_style="bold")
+    table.add_column("Key", style="dim")
+    table.add_column("Value")
+    table.add_row("Unique release_ids", str(summary.unique_release_ids))
+    table.add_row("Fetched (this run)", str(summary.fetched))
+    table.add_row("Skipped (cached)", str(summary.skipped_cached))
+    table.add_row("Failed", str(summary.failed))
+    table.add_row("Orphan files (no release_id)", str(summary.orphan_files))
+    table.add_row("Total local files", str(summary.total_local_files))
+    table.add_row("Matched local files", str(summary.matched_local_files))
+    table.add_row("  by recording_id", str(summary.matched_by_recording_id))
+    table.add_row("  by release_track_id", str(summary.matched_by_release_track_id))
+    table.add_row("  by position", str(summary.matched_by_position))
+    table.add_row("Output size", _human_size(out_path.stat().st_size))
+    console.print(table)
+
+    if summary.failed:
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("jsonl_file", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
+@click.option(
+    "--mode",
+    type=click.Choice(["release-tags", "recording-id", "all"]),
+    default="release-tags",
+    show_default=True,
+    help="Patch scope: release-tags patches script/releasecountry; recording-id patches missing recording MBIDs.",
+)
 @click.option("--apply", "do_apply", is_flag=True, default=False, help="Actually write tags. Without this flag, only a dry-run plan is shown.")
 @click.option("--delay", type=float, default=1.0, show_default=True, help="Seconds between MusicBrainz API requests.")
-def patch(jsonl_file: str, do_apply: bool, delay: float) -> None:
-    """Patch missing release-level tags (script, releasecountry) via MusicBrainz API."""
+def patch(jsonl_file: str, mode: str, do_apply: bool, delay: float) -> None:
+    """Patch missing MusicBrainz tags via the MusicBrainz API."""
     jsonl_path = Path(jsonl_file)
 
-    mode = "[bold red]APPLY[/bold red]" if do_apply else "[bold yellow]dry-run[/bold yellow]"
-    console.print(f"[bold]tagwell patch[/bold]  {jsonl_path}  ({mode})")
+    apply_mode = "[bold red]APPLY[/bold red]" if do_apply else "[bold yellow]dry-run[/bold yellow]"
+    console.print(f"[bold]tagwell patch[/bold]  {jsonl_path}  ({mode}, {apply_mode})")
     console.print()
 
     def on_progress(i: int, total: int, rid: str) -> None:
         console.print(f"  [{i}/{total}] {rid[:12]}…", end="")
 
     console.print("Querying MusicBrainz API…")
-    plan = build_plan(jsonl_path, delay=delay, on_progress=on_progress)
+    plan = build_plan(jsonl_path, mode=mode, delay=delay, on_progress=on_progress)
     console.print()
     console.print(
         f"  ✓ {len(plan.release_cache)} releases fetched"
@@ -124,6 +225,7 @@ def patch(jsonl_file: str, do_apply: bool, delay: float) -> None:
     table = Table(title="Patch Summary", show_header=False, title_style="bold")
     table.add_column("Key", style="dim")
     table.add_column("Value")
+    table.add_row("Mode", mode)
     table.add_row("Target files", str(summary.total_targets))
     table.add_row("Unique releases", str(summary.unique_releases))
     table.add_row("API fetched", str(summary.api_fetched))
@@ -137,9 +239,10 @@ def patch(jsonl_file: str, do_apply: bool, delay: float) -> None:
 
     # Write patch log alongside the JSONL file
     if do_apply and actions:
-        log_path = jsonl_path.parent / "patch-log.txt"
+        log_name = "patch-log.txt" if mode == "release-tags" else f"patch-log-{mode}.txt"
+        log_path = jsonl_path.parent / log_name
         with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write(f"tagwell patch --apply  {jsonl_path}\n")
+            lf.write(f"tagwell patch --mode {mode} --apply  {jsonl_path}\n")
             lf.write(f"Files patched: {summary.files_patched}  Fields written: {summary.fields_written}\n\n")
             for rel_path, fields in actions:
                 lf.write(f"{rel_path}\n")

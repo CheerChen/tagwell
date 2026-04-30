@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-Snapshot = dict[str, Any]
-WriteLine = Callable[[str], None]
+from tagwell._report_helpers import (
+    Snapshot,
+    WriteLine,
+    _audio,
+    _file,
+    _md,
+    _pct,
+    _relative_path,
+    _render_source_info,
+    _sort_text,
+    _tags,
+    load_snapshots,
+)
 
 _SCRIPT_BUCKETS: list[tuple[str, set[str]]] = [
     ("Japanese", {"Jpan", "Kana"}),
@@ -38,24 +48,6 @@ class AlbumGroup:
     album_artists: tuple[str, ...] = ()
     release_id: str | None = None
     snapshots: list[Snapshot] = field(default_factory=list)
-
-
-def load_snapshots(jsonl_path: Path) -> tuple[Snapshot | None, list[Snapshot]]:
-    """Load a tagwell JSONL file. Returns (header_or_None, list_of_snapshots)."""
-    header = None
-    snapshots: list[Snapshot] = []
-    with open(jsonl_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            record_type = rec.get("record_type")
-            if record_type == "scan_header":
-                header = rec
-            elif record_type == "audio_file_snapshot":
-                snapshots.append(rec)
-    return header, snapshots
 
 
 def generate_report(jsonl_path: Path) -> str:
@@ -91,25 +83,8 @@ def generate_report(jsonl_path: Path) -> str:
     _render_release_country_profile(write, snapshots)
     _render_duration_profile(write, snapshots)
     _render_collaboration_profile(write, snapshots)
-    _render_encoding_profile(write, snapshots)
 
     return "\n".join(lines) + "\n"
-
-
-def _render_source_info(write: WriteLine, jsonl_path: Path, header: Snapshot | None) -> None:
-    if not header:
-        return
-
-    scan = header.get("scan", {})
-    scanner = header.get("scanner", {})
-    write(f"- **Source**: `{jsonl_path.name}`")
-    write(f"- **Scan root**: `{scan.get('root', '?')}`")
-    write(f"- **Scanned at**: {scan.get('started_at', '?')}")
-    write(f"- **Scanner**: {scanner.get('name', '?')} {scanner.get('version', '?')}")
-    reader = scanner.get("reader", {})
-    if reader:
-        write(f"- **Reader**: {reader.get('name', '?')} {reader.get('version', '?')}")
-    write("")
 
 
 def _render_overview(write: WriteLine, snapshots: list[Snapshot], album_groups: list[AlbumGroup]) -> None:
@@ -735,94 +710,6 @@ def _render_label_profile(write: WriteLine, snapshots: list[Snapshot]) -> None:
     write(f"Top 5 labels account for {_pct(top5_sum, has_label)} of labeled files ({top5_sum}/{has_label}).\n")
 
 
-def _render_encoding_profile(write: WriteLine, snapshots: list[Snapshot]) -> None:
-    format_counter: Counter[str] = Counter()
-    formats_by_class: dict[str, set[str]] = defaultdict(set)
-    lossy_bitrates: list[float] = []
-    lossless_sample_rates: Counter[str] = Counter()
-    lossless_bit_depths: Counter[str] = Counter()
-
-    lossless_count = 0
-    lossy_count = 0
-    unknown_count = 0
-
-    for snapshot in snapshots:
-        audio = _audio(snapshot)
-        container = audio.get("container") or "unknown"
-        codec = audio.get("codec") or "unknown"
-        format_label = f"{container}/{codec}" if container != codec else codec
-        format_counter[format_label] += 1
-
-        lossless = audio.get("lossless")
-        if lossless is True:
-            lossless_count += 1
-            formats_by_class["lossless"].add(format_label)
-            sample_rate = audio.get("sample_rate_hz")
-            bit_depth = audio.get("bit_depth")
-            if sample_rate:
-                lossless_sample_rates[f"{sample_rate} Hz"] += 1
-            if bit_depth:
-                lossless_bit_depths[f"{bit_depth}-bit"] += 1
-        elif lossless is False:
-            lossy_count += 1
-            formats_by_class["lossy"].add(format_label)
-            bitrate = audio.get("estimated_bitrate_kbps")
-            if bitrate is not None:
-                lossy_bitrates.append(bitrate)
-        else:
-            unknown_count += 1
-            formats_by_class["unknown"].add(format_label)
-
-    write("### Encoding profile\n")
-    if lossless_count:
-        write(f"- **Lossless**: {lossless_count} files ({', '.join(sorted(formats_by_class['lossless'], key=_sort_text))})")
-    if lossy_count:
-        write(f"- **Lossy**: {lossy_count} files ({', '.join(sorted(formats_by_class['lossy'], key=_sort_text))})")
-    if unknown_count:
-        write(f"- **Unknown**: {unknown_count} files ({', '.join(sorted(formats_by_class['unknown'], key=_sort_text))})")
-    write("")
-
-    nonzero_classes = sum(1 for count in (lossless_count, lossy_count, unknown_count) if count)
-    show_codec_table = any(len(values) > 1 for values in formats_by_class.values()) or len(format_counter) > nonzero_classes
-    if show_codec_table:
-        write("| Format | Count | % of library |")
-        write("|--------|-------|--------------|")
-        for format_label, count in sorted(format_counter.items(), key=lambda item: (-item[1], _sort_text(item[0]))):
-            write(f"| {_md(format_label)} | {count} | {_pct(count, len(snapshots))} |")
-        write("")
-
-    if lossy_bitrates:
-        rounded_bitrates: Counter[str] = Counter()
-        for bitrate in lossy_bitrates:
-            rounded_bitrates[_format_number(bitrate)] += 1
-
-        if len(rounded_bitrates) == 1:
-            bitrate_label = next(iter(rounded_bitrates))
-            write(f"All lossy files are {bitrate_label} kbps.\n")
-        else:
-            write("#### Lossy bitrate distribution\n")
-            write("| Bitrate | Files | % of lossy files |")
-            write("|---------|-------|------------------|")
-            for bitrate, count in sorted(rounded_bitrates.items(), key=lambda item: (float(item[0]), item[0])):
-                write(f"| {bitrate} kbps | {count} | {_pct(count, len(lossy_bitrates))} |")
-            write("")
-
-    if lossless_sample_rates:
-        write("#### Lossless quality\n")
-        write("| Sample rate | Count |")
-        write("|-------------|-------|")
-        for sample_rate, count in sorted(lossless_sample_rates.items(), key=lambda item: (-item[1], _sort_text(item[0]))):
-            write(f"| {sample_rate} | {count} |")
-        write("")
-
-        if lossless_bit_depths:
-            write("| Bit depth | Count |")
-            write("|-----------|-------|")
-            for bit_depth, count in sorted(lossless_bit_depths.items(), key=lambda item: (-item[1], _sort_text(item[0]))):
-                write(f"| {bit_depth} | {count} |")
-            write("")
-
-
 def _build_album_groups(snapshots: list[Snapshot]) -> tuple[list[AlbumGroup], dict[int, AlbumGroup]]:
     release_ids_by_fallback: dict[tuple[str, tuple[str, ...]], set[str]] = defaultdict(set)
     fallback_keys: dict[int, tuple[str, tuple[str, ...]] | None] = {}
@@ -893,24 +780,8 @@ def _parsed(snapshot: Snapshot) -> Snapshot:
     return _tags(snapshot).get("parsed", {})
 
 
-def _tags(snapshot: Snapshot) -> Snapshot:
-    return snapshot.get("tags", {})
-
-
-def _audio(snapshot: Snapshot) -> Snapshot:
-    return snapshot.get("audio", {})
-
-
-def _file(snapshot: Snapshot) -> Snapshot:
-    return snapshot.get("file", {})
-
-
 def _musicbrainz(snapshot: Snapshot) -> Snapshot:
     return _tags(snapshot).get("external_ids", {}).get("musicbrainz", {})
-
-
-def _relative_path(snapshot: Snapshot) -> str:
-    return _file(snapshot).get("relative_path", "(unknown path)")
 
 
 def _first_raw_value(snapshot: Snapshot, field_name: str) -> str | None:
@@ -993,23 +864,3 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
-
-
-def _format_number(value: float) -> str:
-    if float(value).is_integer():
-        return str(int(value))
-    return f"{value:.1f}"
-
-
-def _sort_text(value: Any) -> str:
-    return str(value).casefold()
-
-
-def _md(value: Any) -> str:
-    return str(value).replace("|", "\\|").replace("\n", " ")
-
-
-def _pct(count: int, total: int) -> str:
-    if total == 0:
-        return "–"
-    return f"{count / total * 100:.1f}%"
