@@ -73,16 +73,16 @@ def report() -> None:
     """Generate Markdown reports from tagwell JSONL files."""
 
 
-def _auto_report_path(report_type: str) -> Path:
-    """Return a timestamped report path in the current working directory."""
+def _auto_report_path(report_type: str, jsonl_file: str) -> Path:
+    """Return a timestamped report path in the same directory as the source JSONL."""
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    return Path(f"report-{report_type}-{ts}.md")
+    return Path(jsonl_file).parent / f"report-{report_type}-{ts}.md"
 
 
 def _render_report(name: str, jsonl_file: str, output: str | None, autoname: bool, generator) -> None:
     jsonl_path = Path(jsonl_file)
     if autoname or output is None:
-        out_path = _auto_report_path(name)
+        out_path = _auto_report_path(name, jsonl_file)
     else:
         out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

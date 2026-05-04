@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tagwell.complete import (
+    _extract_work_credits,
     build_release_snapshot,
     build_releases_jsonl,
     compute_completeness,
@@ -176,6 +177,114 @@ class TestDetectInstrumental:
             {"type": "remix", "target-type": "recording", "attributes": ["instrumental"]}
         ]}
         assert detect_instrumental(track, recording) == (False, None)
+
+
+# ---------- _extract_work_credits ----------
+
+class TestExtractWorkCredits:
+    def _recording_with_work(self, *, composer_id="art-c", composer_name="菅野よう子",
+                              lyricist_id=None, lyricist_name=None,
+                              inst_attrs=None) -> dict:
+        work_rels = [
+            {"type": "composer", "target-type": "artist",
+             "artist": {"id": composer_id, "name": composer_name}},
+        ]
+        if lyricist_id:
+            work_rels.append({
+                "type": "lyricist", "target-type": "artist",
+                "artist": {"id": lyricist_id, "name": lyricist_name or ""},
+            })
+        return {
+            "relations": [{
+                "type": "performance",
+                "target-type": "work",
+                "attributes": inst_attrs or [],
+                "work": {"id": "work-1", "relations": work_rels},
+            }]
+        }
+
+    def test_extracts_composer(self):
+        recording = self._recording_with_work()
+        credits = _extract_work_credits(recording)
+        assert len(credits) == 1
+        assert credits[0]["type"] == "composer"
+        assert credits[0]["artist"]["name"] == "菅野よう子"
+
+    def test_extracts_multiple_role_types(self):
+        recording = self._recording_with_work(
+            lyricist_id="art-l", lyricist_name="岩里祐穂"
+        )
+        credits = _extract_work_credits(recording)
+        types = {c["type"] for c in credits}
+        assert types == {"composer", "lyricist"}
+
+    def test_deduplicates_same_artist_same_role(self):
+        # Two works on the same recording, same composer → should appear once
+        recording = {
+            "relations": [
+                {"type": "performance", "target-type": "work", "attributes": [],
+                 "work": {"id": "w1", "relations": [
+                     {"type": "composer", "target-type": "artist",
+                      "artist": {"id": "art-c", "name": "菅野よう子"}},
+                 ]}},
+                {"type": "performance", "target-type": "work", "attributes": [],
+                 "work": {"id": "w2", "relations": [
+                     {"type": "composer", "target-type": "artist",
+                      "artist": {"id": "art-c", "name": "菅野よう子"}},
+                 ]}},
+            ]
+        }
+        credits = _extract_work_credits(recording)
+        assert len(credits) == 1
+
+    def test_ignores_non_artist_work_relations(self):
+        recording = {
+            "relations": [{
+                "type": "performance", "target-type": "work", "attributes": [],
+                "work": {"id": "w1", "relations": [
+                    {"type": "based on", "target-type": "work",
+                     "work": {"id": "w2"}},
+                ]},
+            }]
+        }
+        assert _extract_work_credits(recording) == []
+
+    def test_ignores_unknown_credit_types(self):
+        recording = {
+            "relations": [{
+                "type": "performance", "target-type": "work", "attributes": [],
+                "work": {"id": "w1", "relations": [
+                    {"type": "producer", "target-type": "artist",
+                     "artist": {"id": "art-p", "name": "Someone"}},
+                ]},
+            }]
+        }
+        assert _extract_work_credits(recording) == []
+
+    def test_empty_when_no_performance_relation(self):
+        recording = {"relations": [
+            {"type": "remix", "target-type": "recording", "attributes": []}
+        ]}
+        assert _extract_work_credits(recording) == []
+
+    def test_work_rels_in_snapshot_after_build(self):
+        raw = _mb_release("rel-1", title="Album", tracks=[
+            _mb_track(
+                position=1, title="Song", recording_id="rec-1", release_track_id="rt-1",
+                relations=[{
+                    "type": "performance", "target-type": "work", "attributes": [],
+                    "work": {"id": "w1", "relations": [
+                        {"type": "composer", "target-type": "artist",
+                         "artist": {"id": "art-c", "name": "菅野よう子"}},
+                    ]},
+                }],
+            )
+        ])
+        snap = build_release_snapshot(raw, "rel-1")
+        track = snap["media"][0]["tracks"][0]
+        assert track["work_rels"] == [
+            {"type": "composer", "artist": {"id": "art-c", "name": "菅野よう子"}}
+        ]
 
 
 # ---------- match_local_files priority ----------

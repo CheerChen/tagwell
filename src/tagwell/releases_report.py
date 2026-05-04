@@ -81,6 +81,7 @@ def generate_releases_report(jsonl_path: Path) -> str:
     _render_decade_profile(write, snapshots)
     _render_below_full_completeness(write, snapshots)
     _render_multi_disc(write, snapshots)
+    _render_creator_sections(write, snapshots)
     _render_failed_releases(write, parsed["errors"])
 
     return "\n".join(lines) + "\n"
@@ -498,6 +499,278 @@ def _render_multi_disc(write: WriteLine, snapshots: list[Snapshot]) -> None:
         if len(single_disc) > _MULTI_DISC_LIMIT:
             write(f"\n…and {len(single_disc) - _MULTI_DISC_LIMIT} more single-disc-touch releases.")
         write("")
+
+
+# ---------- Creator sections ----------
+
+_CREATOR_RANK_LIMIT = 20
+_EDGE_LIST_MIN_TRACKS = 2  # minimum tracks for an edge to appear in the list
+
+
+def _collect_credits(snapshots: list[Snapshot]) -> list[dict[str, Any]]:
+    """Flatten all work_rels from all vocal tracks into a list of credit dicts.
+
+    Each item: {type, artist_id, artist_name, album_artist, album, recording_id, has_local}
+    """
+    rows: list[dict[str, Any]] = []
+    for snap in snapshots:
+        album_artist = _artist_label(snap)
+        album = snap.get("title") or snap.get("release_id") or "?"
+        for medium in snap.get("media", []):
+            for track in medium.get("tracks", []):
+                if track.get("is_instrumental"):
+                    continue
+                recording_id = track.get("recording_id") or ""
+                has_local = bool(track.get("local"))
+                for wrel in track.get("work_rels") or []:
+                    artist = wrel.get("artist") or {}
+                    rows.append({
+                        "type": wrel.get("type") or "",
+                        "artist_id": artist.get("id") or "",
+                        "artist_name": artist.get("name") or "",
+                        "album_artist": album_artist,
+                        "album": album,
+                        "recording_id": recording_id,
+                        "has_local": has_local,
+                    })
+    return rows
+
+
+def _build_owned_recordings(snapshots: list[Snapshot]) -> dict[str, list[dict[str, Any]]]:
+    """Build unique owned recording map: recording_id → work_rels (first seen with local).
+
+    Only vocal recordings where at least one release track has local files.
+    """
+    result: dict[str, list[dict[str, Any]]] = {}
+    for snap in snapshots:
+        for medium in snap.get("media", []):
+            for track in medium.get("tracks", []):
+                if track.get("is_instrumental"):
+                    continue
+                rid = track.get("recording_id")
+                if not rid or rid in result:
+                    continue
+                if track.get("local"):
+                    result[rid] = track.get("work_rels") or []
+    return result
+
+
+def _render_creator_sections(write: WriteLine, snapshots: list[Snapshot]) -> None:
+    credits = _collect_credits(snapshots)
+    if not credits:
+        return
+
+    owned = _build_owned_recordings(snapshots)
+
+    # Release-level (track instances)
+    _render_top_creators(write, snapshots, credits, "composer", level="release")
+    _render_top_creators(write, snapshots, credits, "lyricist", level="release")
+
+    # Library-level (owned recordings)
+    _render_top_creators_library(write, owned, "composer")
+    _render_top_creators_library(write, owned, "lyricist")
+
+    # Edge list (library-level)
+    _render_composer_artist_edges(write, snapshots, credits)
+
+    # Coverage (both levels)
+    _render_composer_coverage(write, snapshots, owned)
+
+
+def _render_top_creators(
+    write: WriteLine,
+    snapshots: list[Snapshot],
+    credits: list[dict[str, Any]],
+    role: str,
+    *,
+    level: str = "release",
+) -> None:
+    counter: Counter[str] = Counter()
+    names: dict[str, str] = {}
+    for c in credits:
+        if c["type"] != role:
+            continue
+        aid = c["artist_id"]
+        counter[aid] += 1
+        names[aid] = c["artist_name"]
+
+    if not counter:
+        return
+
+    total_instances = sum(
+        1
+        for snap in snapshots
+        for medium in snap.get("media", [])
+        for track in medium.get("tracks", [])
+        if not track.get("is_instrumental")
+    )
+
+    title = "Top composers" if role == "composer" else f"Top {role}s"
+    write(f"## {title} — release-level ({total_instances:,} track instances)\n")
+    write(
+        f"Counted per vocal track instance with a `{role}` work relation in MusicBrainz. "
+        "The same recording appearing on multiple releases is counted once per appearance. "
+        "Tracks with multiple credits each count once per credited artist.\n"
+    )
+    write(f"| {role.capitalize()} | Instances | % of track instances |")
+    write("|---|---|---|")
+    for aid, count in counter.most_common(_CREATOR_RANK_LIMIT):
+        write(f"| {_md(names[aid])} | {count} | {_pct(count, total_instances)} |")
+    if len(counter) > _CREATOR_RANK_LIMIT:
+        write(f"\n…and {len(counter) - _CREATOR_RANK_LIMIT} more {role}s in the library.")
+    write("")
+
+
+def _render_top_creators_library(
+    write: WriteLine,
+    owned: dict[str, list[dict[str, Any]]],
+    role: str,
+) -> None:
+    counter: Counter[str] = Counter()
+    names: dict[str, str] = {}
+    seen: set[tuple[str, str]] = set()  # (recording_id, artist_id)
+    for rid, work_rels in owned.items():
+        for wrel in work_rels:
+            if (wrel.get("type") or "") != role:
+                continue
+            artist = wrel.get("artist") or {}
+            aid = artist.get("id") or ""
+            key = (rid, aid)
+            if key in seen:
+                continue
+            seen.add(key)
+            counter[aid] += 1
+            names[aid] = artist.get("name") or ""
+
+    if not counter:
+        return
+
+    total_owned = len(owned)
+    title = "Top composers" if role == "composer" else f"Top {role}s"
+    write(f"## {title} — library-level ({total_owned:,} owned recordings)\n")
+    write(
+        f"Counted per unique owned recording with a `{role}` work relation. "
+        "Each (recording, artist) pair counts once regardless of how many releases contain it.\n"
+    )
+    write(f"| {role.capitalize()} | Recordings | % of owned |")
+    write("|---|---|---|")
+    for aid, count in counter.most_common(_CREATOR_RANK_LIMIT):
+        write(f"| {_md(names[aid])} | {count} | {_pct(count, total_owned)} |")
+    if len(counter) > _CREATOR_RANK_LIMIT:
+        write(f"\n…and {len(counter) - _CREATOR_RANK_LIMIT} more {role}s.")
+    write("")
+
+
+def _render_composer_artist_edges(
+    write: WriteLine,
+    snapshots: list[Snapshot],
+    credits: list[dict[str, Any]],
+) -> None:
+    """Render composer × album-artist as a long-format edge list (library-level).
+
+    Each edge is deduped by (recording_id, composer_id, album_artist).
+    """
+    # Collect unique edges: (composer_id, album_artist) → set of recording_ids
+    edges: dict[tuple[str, str], set[str]] = defaultdict(set)
+    names: dict[str, str] = {}
+    for c in credits:
+        if c["type"] != "composer":
+            continue
+        if not c["has_local"]:
+            continue
+        aid = c["artist_id"]
+        edges[(aid, c["album_artist"])].add(c["recording_id"])
+        names[aid] = c["artist_name"]
+
+    if not edges:
+        return
+
+    # Build sorted edge rows
+    edge_rows: list[tuple[str, str, int]] = []
+    composer_totals: Counter[str] = Counter()
+    for (aid, aa), rids in edges.items():
+        cnt = len(rids)
+        if cnt < _EDGE_LIST_MIN_TRACKS:
+            continue
+        edge_rows.append((aid, aa, cnt))
+        composer_totals[aid] += cnt
+
+    if not edge_rows:
+        return
+
+    # Sort: by composer total desc, then edge count desc
+    composer_rank = {aid: (-total, names.get(aid, ""))
+                    for aid, total in composer_totals.most_common()}
+    edge_rows.sort(key=lambda r: (composer_rank.get(r[0], (0, "")), -r[2]))
+
+    # Truncate to top 20 composers' edges
+    top_composers = [aid for aid, _ in composer_totals.most_common(_CREATOR_RANK_LIMIT)]
+    top_set = set(top_composers)
+    edge_rows = [r for r in edge_rows if r[0] in top_set]
+
+    write("## Composer × album-artist connections\n")
+    write(
+        "Each row is one (composer, album artist) edge, deduplicated by owned recording. "
+        f"Only edges with ≥{_EDGE_LIST_MIN_TRACKS} recordings shown; "
+        f"top {_CREATOR_RANK_LIMIT} composers by total.\n"
+    )
+    write("| Composer | Album artist | Recordings |")
+    write("|---|---|---|")
+    for aid, aa, cnt in edge_rows:
+        write(f"| {_md(names[aid])} | {_md(aa)} | {cnt} |")
+    write("")
+
+
+def _render_composer_coverage(
+    write: WriteLine,
+    snapshots: list[Snapshot],
+    owned: dict[str, list[dict[str, Any]]],
+) -> None:
+    # Release-level
+    rl_total = 0
+    rl_has = 0
+    for snap in snapshots:
+        for medium in snap.get("media", []):
+            for track in medium.get("tracks", []):
+                if track.get("is_instrumental"):
+                    continue
+                rl_total += 1
+                if any(wrel.get("type") == "composer" for wrel in (track.get("work_rels") or [])):
+                    rl_has += 1
+    rl_no = rl_total - rl_has
+
+    # Library-level
+    ll_total = len(owned)
+    ll_has = sum(
+        1 for wrels in owned.values()
+        if any(wrel.get("type") == "composer" for wrel in wrels)
+    )
+    ll_no = ll_total - ll_has
+
+    if rl_total == 0 and ll_total == 0:
+        return
+
+    write("## Composer coverage\n")
+    write(
+        "How many vocal tracks have at least one `composer` work relation in MusicBrainz. "
+        "Release-level counts every track instance across all releases; "
+        "library-level deduplicates to owned recordings only.\n"
+    )
+    write("| | Release-level | % | Library-level | % |")
+    write("|---|---|---|---|---|")
+    write(
+        f"| Has composer | {rl_has:,} | {_pct(rl_has, rl_total)} "
+        f"| {ll_has:,} | {_pct(ll_has, ll_total)} |"
+    )
+    write(
+        f"| No composer | {rl_no:,} | {_pct(rl_no, rl_total)} "
+        f"| {ll_no:,} | {_pct(ll_no, ll_total)} |"
+    )
+    write(
+        f"| **Total** | **{rl_total:,}** | "
+        f"| **{ll_total:,}** | |"
+    )
+    write("")
 
 
 def _render_failed_releases(write: WriteLine, errors: list[dict]) -> None:

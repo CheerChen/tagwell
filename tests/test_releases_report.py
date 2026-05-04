@@ -370,3 +370,89 @@ def test_completeness_by_type_table(tmp_path: Path):
     assert "| Album | 2 | 75.0% | 1 (50.0%) |" in md
     # Compilation bucket: 1 release at 25%
     assert "| Album + Compilation | 1 | 25.0% | 0 (0.0%) |" in md
+
+
+def _track_with_credits(position: int, title: str, *,
+                        work_rels: list | None = None,
+                        local: list | None = None) -> dict:
+    t = _track(position, title, local=local)
+    t["work_rels"] = work_rels or []
+    return t
+
+
+def test_top_composers_section(tmp_path: Path):
+    rel = _release("rel-1", "Sakamichi Album", artist="坂本真綾", tracks=[
+        _track_with_credits(1, "Song A", work_rels=[
+            {"type": "composer", "artist": {"id": "art-c", "name": "菅野よう子"}},
+        ], local=[{"relative_path": "a.flac", "matched_by": "recording_id"}]),
+        _track_with_credits(2, "Song B", work_rels=[
+            {"type": "composer", "artist": {"id": "art-c", "name": "菅野よう子"}},
+            {"type": "lyricist", "artist": {"id": "art-l", "name": "岩里祐穂"}},
+        ], local=[{"relative_path": "b.flac", "matched_by": "recording_id"}]),
+        _track_with_credits(3, "Song C"),  # no work_rels
+    ])
+    md = generate_releases_report(_write(tmp_path, _header(), rel, _trailer()))
+
+    assert "## Top composers — release-level" in md
+    assert "菅野よう子" in md
+    assert "| 菅野よう子 | 2 |" in md
+
+    assert "## Top lyricists — release-level" in md
+    assert "岩里祐穂" in md
+
+    # Library-level should also appear
+    assert "## Top composers — library-level" in md
+    assert "## Top lyricists — library-level" in md
+
+
+def test_composer_artist_matrix(tmp_path: Path):
+    rel1 = _release("rel-1", "Album A", artist="坂本真綾", tracks=[
+        _track_with_credits(1, "S1", work_rels=[
+            {"type": "composer", "artist": {"id": "art-c", "name": "菅野よう子"}},
+        ], local=[{"relative_path": "a.flac", "matched_by": "recording_id"}]),
+        _track_with_credits(2, "S1b", work_rels=[
+            {"type": "composer", "artist": {"id": "art-c", "name": "菅野よう子"}},
+        ], local=[{"relative_path": "a2.flac", "matched_by": "recording_id"}]),
+    ])
+    rel2 = _release("rel-2", "Album B", artist="KOTOKO", tracks=[
+        _track_with_credits(1, "S2", work_rels=[
+            {"type": "composer", "artist": {"id": "art-c2", "name": "中坪淳彦"}},
+        ], local=[{"relative_path": "b.flac", "matched_by": "recording_id"}]),
+        _track_with_credits(2, "S2b", work_rels=[
+            {"type": "composer", "artist": {"id": "art-c2", "name": "中坪淳彦"}},
+        ], local=[{"relative_path": "b2.flac", "matched_by": "recording_id"}]),
+    ])
+    md = generate_releases_report(_write(tmp_path, _header(), rel1, rel2, _trailer()))
+
+    assert "## Composer × album-artist connections" in md
+    assert "菅野よう子" in md
+    assert "坂本真綾" in md
+    assert "中坪淳彦" in md
+
+
+def test_composer_coverage_section(tmp_path: Path):
+    rel = _release("rel-1", "Album", tracks=[
+        _track_with_credits(1, "Has composer", work_rels=[
+            {"type": "composer", "artist": {"id": "art-c", "name": "X"}},
+        ], local=[{"relative_path": "a.flac", "matched_by": "recording_id"}]),
+        _track_with_credits(2, "No composer", local=[{"relative_path": "b.flac", "matched_by": "recording_id"}]),
+        _track_with_credits(3, "Inst", work_rels=[], local=[{"relative_path": "c.flac", "matched_by": "recording_id"}]),
+    ])
+    # make track 3 instrumental
+    rel["media"][0]["tracks"][2]["is_instrumental"] = True
+    compute_completeness(rel)
+    md = generate_releases_report(_write(tmp_path, _header(), rel, _trailer()))
+
+    assert "## Composer coverage" in md
+    assert "Has composer" in md
+    assert "No composer" in md
+
+
+def test_no_creator_section_when_no_work_rels(tmp_path: Path):
+    rel = _release("rel-1", "Album", tracks=[
+        _track(1, "Song", local=[{"relative_path": "a.flac", "matched_by": "recording_id"}]),
+    ])
+    md = generate_releases_report(_write(tmp_path, _header(), rel, _trailer()))
+
+    assert "## Top composers" not in md
+    assert "## Composer ×" not in md

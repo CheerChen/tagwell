@@ -23,7 +23,7 @@ RELEASES_SCHEMA_VERSION = 2
 
 _USER_AGENT = "tagwell/0.1.0 ( https://github.com/CheerChen/tagwell )"
 _MB_API_BASE = "https://musicbrainz.org/ws/2"
-_INC = "recordings+media+release-groups+artist-credits+labels+work-rels"
+_INC = "recordings+media+release-groups+artist-credits+labels+recording-level-rels+work-rels+work-level-rels+artist-rels"
 
 _INST_REL_ATTRS = {"instrumental", "karaoke"}
 
@@ -76,6 +76,42 @@ def detect_instrumental(track: dict[str, Any], recording: dict[str, Any]) -> tup
     return False, None
 
 
+# ---------- Work-level credits ----------
+
+_CREDIT_TYPES = {"composer", "lyricist", "arranger", "writer", "orchestrator", "translator"}
+
+
+def _extract_work_credits(recording: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return [{type, artist: {id, name}}] from work-level relations on this recording.
+
+    Traverses: recording.relations → performance→work → work.relations → artist credits.
+    Collects only relation types in _CREDIT_TYPES; deduplicates by (type, artist_id).
+    """
+    seen: set[tuple[str, str]] = set()
+    credits: list[dict[str, Any]] = []
+    for rel in recording.get("relations") or []:
+        if rel.get("type") != "performance" or rel.get("target-type") != "work":
+            continue
+        work = rel.get("work") or {}
+        for wrel in work.get("relations") or []:
+            if wrel.get("target-type") != "artist":
+                continue
+            rtype = (wrel.get("type") or "").lower()
+            if rtype not in _CREDIT_TYPES:
+                continue
+            artist = wrel.get("artist") or {}
+            aid = artist.get("id") or ""
+            key = (rtype, aid)
+            if key in seen:
+                continue
+            seen.add(key)
+            credits.append({
+                "type": rtype,
+                "artist": {"id": aid, "name": artist.get("name") or ""},
+            })
+    return credits
+
+
 # ---------- Build a release_snapshot record from raw MB JSON ----------
 
 def build_release_snapshot(raw: dict[str, Any], release_id: str) -> dict[str, Any]:
@@ -94,6 +130,7 @@ def build_release_snapshot(raw: dict[str, Any], release_id: str) -> dict[str, An
                 "recording_id": recording.get("id"),
                 "is_instrumental": is_inst,
                 "inst_signal": signal,
+                "work_rels": _extract_work_credits(recording),
                 "local": [],
             })
         media.append({
