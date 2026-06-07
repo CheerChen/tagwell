@@ -16,6 +16,13 @@ from tagwell.report import generate_report
 from tagwell.quality import generate_quality_report
 from tagwell.releases_report import generate_releases_report
 from tagwell.complete import build_releases_jsonl
+from tagwell.discover import (
+    ArtistResolutionError,
+    LibraryTooSparse,
+    discover,
+    render_discover_report,
+    resolve_artist_mbid,
+)
 from tagwell.patch import build_plan, apply_plan, dry_run_plan
 
 console = Console(stderr=True)
@@ -252,6 +259,142 @@ def patch(jsonl_file: str, mode: str, do_apply: bool, delay: float) -> None:
 
     if not do_apply and summary.files_patched > 0:
         console.print("\n[dim]Run with --apply to write tags.[/dim]")
+
+
+@cli.command(name="discover")
+@click.argument("artist")
+@click.option("--jsonl", "jsonl_file", default="output/library_releases.jsonl", show_default=True,
+              type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+              help="Source library_releases JSONL.")
+@click.option("--top-n", type=int, default=3, show_default=True,
+              help="Top-N (composer, arranger) combos to flatten into the team pool.")
+@click.option("--include-self", is_flag=True, default=False,
+              help="Keep the target artist in the team pool (default: drop self).")
+@click.option("--existing-only", is_flag=True, default=False,
+              help="Skip MB API; only score recordings already cached on disk.")
+@click.option("--refresh", is_flag=True, default=False,
+              help="Re-fetch from MB, ignoring on-disk cache.")
+@click.option("--delay", type=float, default=1.0, show_default=True,
+              help="Seconds between MB API requests.")
+@click.option("--min-credit-coverage", type=float, default=0.3, show_default=True,
+              help="Refuse if fewer than this fraction of library tracks have composer/arranger credit.")
+@click.option("--force", is_flag=True, default=False,
+              help="Bypass the credit-coverage / empty-team-pool guard.")
+@click.option("--out", "-o", "output", default=None, type=click.Path(dir_okay=False),
+              help="Output Markdown report path. Defaults to a timestamped sibling of the JSONL.")
+def discover_cmd(
+    artist: str,
+    jsonl_file: str,
+    top_n: int,
+    include_self: bool,
+    existing_only: bool,
+    refresh: bool,
+    delay: float,
+    min_credit_coverage: float,
+    force: bool,
+    output: str | None,
+) -> None:
+    """Discover candidate recordings by team overlap with the library.
+
+    ARTIST is either an MBID or a free-text name (resolved via MB search).
+    """
+    try:
+        artist_mbid, resolved_name = resolve_artist_mbid(artist)
+    except ArtistResolutionError as exc:
+        console.print(f"[bold red]Could not resolve artist[/bold red]: {exc.query!r}")
+        if exc.candidates:
+            console.print(f"  top candidates (min score {exc.min_score}):")
+            for a in exc.candidates:
+                disamb = a.get("disambiguation") or ""
+                country = a.get("country") or "--"
+                tail = f"  [dim]{disamb}[/dim]" if disamb else ""
+                console.print(f"    [{a.get('score')}] {a['id']}  {a.get('name')}  ({country}){tail}")
+        else:
+            console.print("  no MB search results")
+        console.print()
+        console.print("[dim]Re-run with the MBID directly.[/dim]")
+        sys.exit(2)
+
+    if resolved_name:
+        console.print(f"  resolved [bold]{artist}[/bold] → {resolved_name}  ({artist_mbid})")
+
+    jsonl_path = Path(jsonl_file)
+    cache_path = jsonl_path.parent / "cache" / f"discover-{artist_mbid}.json"
+
+    if output is None:
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        out_path = jsonl_path.parent / f"report-discover-{artist_mbid[:8]}-{ts}.md"
+    else:
+        out_path = Path(output)
+
+    console.print(f"[bold]tagwell discover[/bold]  {artist}")
+    console.print(f"  jsonl  → {jsonl_path}")
+    console.print(f"  cache  → {cache_path}")
+    console.print(f"  report → {out_path}")
+    console.print()
+
+    def on_browse(done: int, total: int) -> None:
+        console.print(f"  browsing releases {done}/{total}")
+
+    def on_fetch(i: int, total: int, rid: str) -> None:
+        console.print(f"  fetch [{i}/{total}] {rid[:12]}…")
+
+    try:
+        profile, candidates, summary = discover(
+            jsonl_path,
+            artist_mbid,
+            cache_path,
+            top_n=top_n,
+            include_self=include_self,
+            delay=delay,
+            refresh=refresh,
+            existing_only=existing_only,
+            min_credit_coverage=min_credit_coverage,
+            force=force,
+            on_browse=on_browse,
+            on_fetch=on_fetch,
+        )
+    except LibraryTooSparse as exc:
+        p = exc.profile
+        console.print()
+        console.print(f"[bold red]Library too sparse[/bold red]: {exc.reason}")
+        console.print(f"  artist: {p.artist_name or '(unknown)'}  ({artist_mbid})")
+        console.print(f"  library tracks (performer): {p.track_count}")
+        console.print(f"  tracks with composer/arranger credit: {p.tracks_with_credit} "
+                      f"({p.credit_coverage * 100:.0f}%)")
+        console.print(f"  team pool size: {len(p.team_pool)}")
+        console.print()
+        console.print("[dim]Re-run with --force to proceed anyway, or pick an artist with richer credit data.[/dim]")
+        sys.exit(2)
+
+    md = render_discover_report(
+        profile, candidates, summary,
+        top_n=top_n, include_self=include_self, existing_only=existing_only,
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(md, encoding="utf-8")
+
+    console.print()
+    table = Table(title="Discover Summary", show_header=False, title_style="bold")
+    table.add_column("Key", style="dim")
+    table.add_column("Value")
+    table.add_row("Artist", profile.artist_name or "(unknown)")
+    table.add_row("Library tracks (performer)", str(profile.track_count))
+    table.add_row("Top combos", str(len(profile.top_combos)))
+    table.add_row("Team pool size", str(len(profile.team_pool)))
+    table.add_row("MB releases browsed", str(summary.release_ids_browsed))
+    table.add_row("  reused from library", str(summary.release_snapshots_from_library))
+    table.add_row("  reused from cache", str(summary.release_snapshots_from_cache))
+    table.add_row("  fetched this run", str(summary.release_snapshots_fetched))
+    table.add_row("  fetch failures", str(summary.release_fetch_failures))
+    table.add_row("Releases skipped (RG owned)", str(summary.skipped_releases_owned_group))
+    table.add_row("Unique recordings", str(summary.unique_recordings))
+    table.add_row("  already owned", str(summary.skipped_already_owned))
+    table.add_row("  instrumental", str(summary.skipped_instrumental))
+    table.add_row("  no team overlap", str(summary.skipped_no_overlap))
+    table.add_row("Candidates (score ≥ 1)", str(summary.candidates))
+    table.add_row("Report", str(out_path))
+    console.print(table)
 
 
 def _print_summary(summary: dict, out_path: Path, out_size: int) -> None:
